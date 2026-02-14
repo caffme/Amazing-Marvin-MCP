@@ -2,3 +2,5 @@ build
 dist
 src/amazing_marvin_mcp.egg-info
 **/__pycache__
+.env
+uv.lock

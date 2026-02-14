@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import time
 from datetime import datetime
 from typing import Any
@@ -195,7 +196,9 @@ async def get_child_tasks(
 
 @mcp.tool()
 async def get_all_tasks(
-    label: str | None = None, debug: bool = False
+    label: str | None = None,
+    fields: list[str] | None = None,
+    debug: bool = False,
 ) -> StandardResponse:
     """Get all tasks across all projects with optional label filtering (comprehensive search).
 
@@ -204,6 +207,9 @@ async def get_all_tasks(
 
     Args:
         label: Optional label name to filter by. If None, returns all tasks.
+        fields: Optional list of field names to return per task (e.g.
+            ["title", "day", "dueDate", "parentId"]). The "_id" field is
+            always included. If None, returns all fields.
 
     Note: This is a heavy operation that recursively searches all projects.
     """
@@ -211,6 +217,15 @@ async def get_all_tasks(
     try:
         api_client = create_api_client()
         result = get_all_tasks_impl(api_client, label)
+
+        # Project fields if requested
+        if fields and "tasks" in result:
+            field_set = set(fields) | {"_id"}
+            result["tasks"] = [
+                {k: v for k, v in task.items() if k in field_set}
+                for task in result["tasks"]
+            ]
+            result["fields_returned"] = sorted(field_set)
 
         # Estimate API calls based on typical project count
         estimated_api_calls = result.get("api_calls_made", 5)
@@ -227,6 +242,183 @@ async def get_all_tasks(
     except Exception as e:
         logger.exception("Failed to get all tasks")
         return create_error_response(e, "/categories + /children", debug, start_time)
+
+
+@mcp.tool()
+async def query_tasks(
+    label: str | None = None,
+    fields: list[str] | None = None,
+    include_done: bool = False,
+    contains: str | None = None,
+    due: str | None = None,
+    due_before: str | None = None,
+    due_after: str | None = None,
+    scheduled: str | None = None,
+    scheduled_before: str | None = None,
+    scheduled_after: str | None = None,
+    parent_id: str | None = None,
+    is_starred: bool | None = None,
+    debug: bool = False,
+) -> StandardResponse:
+    """Fast query of all tasks via CouchDB _find (single HTTP request).
+
+    Preferred alternative to get_all_tasks() when CouchDB credentials are
+    configured.  Supports server-side field projection so only requested
+    fields travel over the wire.
+
+    Args:
+        label: Optional label name to filter by.
+        fields: Optional list of field names to return per task (e.g.
+            ["title", "day", "dueDate", "parentId"]).  "_id" is always
+            included.  When omitted every field is returned.
+        include_done: If True, include completed tasks (default False).
+        contains: Case-insensitive text search across title and note fields.
+        due: Exact due date match (YYYY-MM-DD). Takes precedence over
+            due_before/due_after.
+        due_before: Tasks due on or before this date (YYYY-MM-DD).
+        due_after: Tasks due on or after this date (YYYY-MM-DD).
+        scheduled: Exact scheduled date match (YYYY-MM-DD). Takes precedence
+            over scheduled_before/scheduled_after.
+        scheduled_before: Tasks scheduled on or before this date (YYYY-MM-DD).
+        scheduled_after: Tasks scheduled on or after this date (YYYY-MM-DD).
+        parent_id: Filter by parent category or project ID.
+        is_starred: Filter by starred status (True=starred, False=unstarred).
+        debug: Include timing / diagnostic metadata.
+
+    Requires env vars: AMAZING_MARVIN_DB_URI, _DB_NAME, _DB_USER,
+    _DB_PASSWORD.
+    """
+    start_time = time.time()
+    try:
+        api_client = create_api_client()
+
+        if not api_client.has_couchdb:
+            return create_error_response(
+                ValueError(
+                    "CouchDB credentials not configured. "
+                    "Set AMAZING_MARVIN_DB_URI, _DB_NAME, _DB_USER, _DB_PASSWORD "
+                    "to use query_tasks. Use get_all_tasks as a fallback."
+                ),
+                "CouchDB _find",
+                debug,
+                start_time,
+            )
+
+        # Build Mango selector
+        selector: dict[str, Any] = {"db": "Tasks"}
+        if not include_done:
+            selector["done"] = {"$ne": True}
+
+        # Label filter — resolve name → ID
+        api_calls = 0
+        if label:
+            labels = api_client.get_labels()
+            api_calls += 1
+            label_match = next(
+                (lb for lb in labels if lb.get("title", "").lower() == label.lower()),
+                None,
+            )
+            if label_match:
+                selector["labelIds"] = {"$elemMatch": {"$eq": label_match["_id"]}}
+            else:
+                return create_simple_response(
+                    data={"tasks": [], "total_tasks": 0},
+                    summary_text=f"No label found matching '{label}'",
+                    api_endpoint="CouchDB _find",
+                    api_calls_made=api_calls,
+                    debug=debug,
+                    start_time=start_time,
+                )
+
+        # Text search — case-insensitive regex across title and note
+        if contains:
+            pattern = f"(?i){re.escape(contains)}"
+            selector["$or"] = [
+                {"title": {"$regex": pattern}},
+                {"note": {"$regex": pattern}},
+            ]
+
+        # Due date filters
+        if due:
+            selector["dueDate"] = due
+        elif due_before or due_after:
+            due_filter: dict[str, str] = {}
+            if due_after:
+                due_filter["$gte"] = due_after
+            if due_before:
+                due_filter["$lte"] = due_before
+            selector["dueDate"] = due_filter
+
+        # Scheduled date filters
+        if scheduled:
+            selector["day"] = scheduled
+        elif scheduled_before or scheduled_after:
+            day_filter: dict[str, str] = {}
+            if scheduled_after:
+                day_filter["$gte"] = scheduled_after
+            if scheduled_before:
+                day_filter["$lte"] = scheduled_before
+            selector["day"] = day_filter
+
+        # Exact match filters
+        if parent_id:
+            selector["parentId"] = parent_id
+        if is_starred is not None:
+            selector["isStarred"] = 1 if is_starred else 0
+
+        docs = api_client.find_docs(selector, fields=fields)
+        api_calls += 1  # The _find call itself
+
+        # Filter out projects/categories client-side
+        tasks = [
+            d for d in docs if d.get("type") not in ("project", "category")
+        ]
+
+        result: dict[str, Any] = {
+            "tasks": tasks,
+            "total_tasks": len(tasks),
+            "source": "CouchDB _find query",
+        }
+        if fields:
+            result["fields_returned"] = sorted(set(fields) | {"_id"})
+        if label:
+            result["label_filter"] = label
+
+        filters = []
+        if label:
+            filters.append(f"label='{label}'")
+        if contains:
+            filters.append(f"contains='{contains}'")
+        if due:
+            filters.append(f"due={due}")
+        if due_before:
+            filters.append(f"due<={due_before}")
+        if due_after:
+            filters.append(f"due>={due_after}")
+        if scheduled:
+            filters.append(f"scheduled={scheduled}")
+        if scheduled_before:
+            filters.append(f"scheduled<={scheduled_before}")
+        if scheduled_after:
+            filters.append(f"scheduled>={scheduled_after}")
+        if parent_id:
+            filters.append(f"parent={parent_id}")
+        if is_starred is not None:
+            filters.append(f"starred={'yes' if is_starred else 'no'}")
+        filter_desc = f" ({', '.join(filters)})" if filters else ""
+        summary_text = f"Retrieved {len(tasks)} tasks via CouchDB{filter_desc}"
+
+        return create_simple_response(
+            data=result,
+            summary_text=summary_text,
+            api_endpoint="CouchDB _find",
+            api_calls_made=api_calls,
+            debug=debug,
+            start_time=start_time,
+        )
+    except Exception as e:
+        logger.exception("Failed to query tasks via CouchDB")
+        return create_error_response(e, "CouchDB _find", debug, start_time)
 
 
 @mcp.tool()
@@ -354,11 +546,20 @@ async def create_task(
 
         created_task = api_client.create_task(task_data)
 
+        # /addTask doesn't reliably set parentId, so fix it via update_doc
+        parent_id = project_id or category_id
+        task_id = created_task.get("_id")
+        if parent_id and task_id and created_task.get("parentId") != parent_id:
+            api_client.update_doc(task_id, [{"key": "parentId", "val": parent_id}])
+            created_task["parentId"] = parent_id
+
+        api_calls = 2 if parent_id and task_id else 1
+
         return create_simple_response(
             data={"created_task": created_task},
             summary_text=f"Created task: {title}",
             api_endpoint="/addTask",
-            api_calls_made=1,
+            api_calls_made=api_calls,
             debug=debug,
             start_time=start_time,
         )
@@ -591,6 +792,174 @@ async def create_project_with_tasks(
 
 
 @mcp.tool()
+async def read_doc(item_id: str, debug: bool = False) -> StandardResponse:
+    """Read any Amazing Marvin document by its ID.
+
+    Returns the full document including all fields. Works for tasks, projects,
+    categories, and other document types.
+
+    Args:
+        item_id: The _id of the document to read
+    """
+    start_time = time.time()
+    try:
+        api_client = create_api_client()
+        doc = api_client.read_doc(item_id)
+
+        return create_simple_response(
+            data=doc,
+            summary_text=f"Read document {item_id}",
+            api_endpoint="/doc",
+            api_calls_made=1,
+            debug=debug,
+            start_time=start_time,
+        )
+    except Exception as e:
+        logger.exception("Failed to read document %s", item_id)
+        return create_error_response(e, "/doc", debug, start_time)
+
+
+@mcp.tool()
+async def update_doc(
+    item_id: str,
+    setters: list[dict],
+    debug: bool = False,
+) -> StandardResponse:
+    """Update fields on any Amazing Marvin document.
+
+    Uses setters to update specific fields without replacing the whole document.
+
+    Args:
+        item_id: The _id of the document to update
+        setters: List of {"key": "fieldName", "val": newValue} objects.
+
+    Task document fields:
+        Core:
+            title (str) - Task title
+            parentId (str) - Category or project ID. Use a category/project _id
+                to move a task, or "unassigned" for inbox
+            db (str) - Always "Tasks" for tasks
+
+        Scheduling & dates:
+            day (str) - Scheduled date "YYYY-MM-DD" or "unassigned". Controls
+                when the task appears in the daily view
+            dueDate (str) - Due date "YYYY-MM-DD" or "" to clear. Separate from
+                the scheduled day - a task can be due Friday but scheduled Monday
+            firstScheduled (str) - Date first scheduled, set automatically
+            plannedWeek (str) - Week planning "YYYY-MM-DD" (Monday of the week)
+            plannedMonth (str) - Month planning "YYYY-MM"
+
+        Status:
+            done (bool) - Completion status
+            doneAt (int) - Completion timestamp in ms
+            isStarred (int) - 0 or 1
+            isFrogged (int) - 0 or 1, "eat the frog" marker
+            backburner (bool) - Deprioritised/on hold
+            isPinned (bool) - Pinned to top
+
+        Content:
+            note (str) - Task notes/description (supports markdown)
+            timeEstimate (int) - Estimated time in milliseconds
+                (e.g. 3600000 = 1 hour)
+            labelIds (list[str]) - List of label IDs
+            rank (int) - Sort order within parent
+            masterRank (int) - Global sort order
+
+        Recurring:
+            recurringTaskId (str) - ID of the recurring config if repeating
+            echoId (str) - ID for echo/reminder tasks
+
+    Examples:
+        Rename: [{"key": "title", "val": "New name"}]
+        Set due date: [{"key": "dueDate", "val": "2026-03-01"}]
+        Clear due date: [{"key": "dueDate", "val": ""}]
+        Move to category: [{"key": "parentId", "val": "category-id-here"}]
+        Schedule for today: [{"key": "day", "val": "2026-02-14"}]
+        Multiple fields: [{"key": "title", "val": "New"}, {"key": "dueDate", "val": "2026-03-01"}]
+    """
+    start_time = time.time()
+    try:
+        api_client = create_api_client()
+        result = api_client.update_doc(item_id, setters)
+
+        return create_simple_response(
+            data=result,
+            summary_text=f"Updated document {item_id}",
+            api_endpoint="/doc/update",
+            api_calls_made=1,
+            debug=debug,
+            start_time=start_time,
+        )
+    except Exception as e:
+        logger.exception("Failed to update document %s", item_id)
+        return create_error_response(e, "/doc/update", debug, start_time)
+
+
+@mcp.tool()
+async def create_doc(doc_data: dict, debug: bool = False) -> StandardResponse:
+    """Create any Amazing Marvin document with full control over all fields.
+
+    Unlike create_task, this gives direct access to all document fields
+    including parentId for category assignment.
+
+    WARNING: For creating tasks, prefer create_task() followed by update_doc()
+    instead. create_doc does not initialise default fields, which can cause
+    tasks to render incorrectly in the Marvin UI. Use create_doc only for
+    non-task documents or when you know all required fields.
+
+    Args:
+        doc_data: Document object. For tasks, include at minimum:
+            _id (unique string), db ("Tasks"), title (string).
+            Optional: parentId (category/project ID), dueDate (YYYY-MM-DD),
+            day (YYYY-MM-DD for scheduling), note, timeEstimate (ms),
+            labelIds (list), rank (int).
+
+    See update_doc docstring for full field reference.
+    """
+    start_time = time.time()
+    try:
+        api_client = create_api_client()
+        result = api_client.create_doc(doc_data)
+
+        return create_simple_response(
+            data=result,
+            summary_text=f"Created document",
+            api_endpoint="/doc/create",
+            api_calls_made=1,
+            debug=debug,
+            start_time=start_time,
+        )
+    except Exception as e:
+        logger.exception("Failed to create document")
+        return create_error_response(e, "/doc/create", debug, start_time)
+
+
+@mcp.tool()
+async def delete_doc(item_id: str, debug: bool = False) -> StandardResponse:
+    """Permanently delete any Amazing Marvin document. This cannot be undone.
+
+    Args:
+        item_id: The _id of the document to delete
+    """
+    start_time = time.time()
+    try:
+        api_client = create_api_client()
+        result = api_client.delete_doc(item_id)
+
+        return create_simple_response(
+            data=result,
+            summary_text=f"Deleted document {item_id}",
+            api_endpoint="/doc/delete",
+            api_calls_made=1,
+            debug=debug,
+            start_time=start_time,
+        )
+    except Exception as e:
+        logger.exception("Failed to delete document %s", item_id)
+        return create_error_response(e, "/doc/delete", debug, start_time)
+
+
+@mcp.tool()
 async def get_project_overview(
     project_id: str, debug: bool = False
 ) -> StandardResponse:
@@ -650,7 +1019,13 @@ async def batch_create_tasks(
     category_id: str | None = None,
     debug: bool = False,
 ) -> StandardResponse:
-    """Create multiple tasks at once with optional project/category assignment"""
+    """Create multiple tasks at once with optional project/category assignment.
+
+    Args:
+        task_list: List of task titles to create
+        project_id: Optional project ID to assign all tasks to
+        category_id: Optional category ID for organization
+    """
     start_time = time.time()
     try:
         api_client = create_api_client()

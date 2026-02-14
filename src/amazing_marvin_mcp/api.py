@@ -11,22 +11,96 @@ logger = logging.getLogger(__name__)
 def create_api_client() -> "MarvinAPIClient":
     """Create API client with settings."""
     settings = get_settings()
-    return MarvinAPIClient(api_key=settings.amazing_marvin_api_key)
+    return MarvinAPIClient(
+        api_key=settings.amazing_marvin_api_key,
+        full_access_token=settings.amazing_marvin_full_access_token,
+        db_uri=settings.amazing_marvin_db_uri,
+        db_name=settings.amazing_marvin_db_name,
+        db_user=settings.amazing_marvin_db_user,
+        db_password=settings.amazing_marvin_db_password,
+    )
 
 
 class MarvinAPIClient:
     """API client for Amazing Marvin"""
 
-    def __init__(self, api_key: str):
+    def __init__(
+        self,
+        api_key: str,
+        full_access_token: str = "",
+        db_uri: str = "",
+        db_name: str = "",
+        db_user: str = "",
+        db_password: str = "",
+    ):
         """
         Initialize the API client with the API key
 
         Args:
             api_key: Amazing Marvin API key
+            full_access_token: Full access token for doc CRUD operations
+            db_uri: CouchDB / Cloudant base URL
+            db_name: CouchDB database name
+            db_user: CouchDB basic-auth username
+            db_password: CouchDB basic-auth password
         """
         self.api_key = api_key
+        self.full_access_token = full_access_token
         self.base_url = "https://serv.amazingmarvin.com/api"  # Removed v1 from URL
         self.headers = {"X-API-Token": api_key}
+        self.full_access_headers = {"X-Full-Access-Token": full_access_token}
+
+        # CouchDB / Cloudant direct access
+        self._db_uri = db_uri.rstrip("/") if db_uri else ""
+        self._db_name = db_name
+        self._db_user = db_user
+        self._db_password = db_password
+
+    @property
+    def has_couchdb(self) -> bool:
+        """True when CouchDB / Cloudant credentials are fully configured."""
+        return all([self._db_uri, self._db_name, self._db_user, self._db_password])
+
+    def find_docs(
+        self,
+        selector: dict,
+        fields: list[str] | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """Query CouchDB directly via the _find endpoint.
+
+        Args:
+            selector: CouchDB Mango selector (e.g. {"db": "Tasks"})
+            fields: Optional field projection — only these fields are returned.
+                    "_id" is always included.
+            limit: Max documents to return (default 500).
+
+        Returns:
+            List of matching documents.
+
+        Raises:
+            ValueError: If CouchDB credentials are not configured.
+            requests.exceptions.HTTPError: On HTTP errors from Cloudant.
+        """
+        if not self.has_couchdb:
+            raise ValueError(
+                "CouchDB credentials not configured. "
+                "Set AMAZING_MARVIN_DB_URI, _DB_NAME, _DB_USER, _DB_PASSWORD."
+            )
+
+        url = f"{self._db_uri}/{self._db_name}/_find"
+        body: dict[str, Any] = {"selector": selector, "limit": limit}
+        if fields:
+            body["fields"] = list(set(fields) | {"_id"})
+
+        logger.debug("CouchDB _find → %s  selector=%s", url, selector)
+        response = requests.post(
+            url,
+            json=body,
+            auth=(self._db_user, self._db_password),
+        )
+        response.raise_for_status()
+        return response.json()["docs"]
 
     def _make_request(
         self, method: str, endpoint: str, data: dict | None = None
@@ -62,6 +136,41 @@ class MarvinAPIClient:
             logger.exception("Request error")
             raise
 
+    def _make_full_access_request(
+        self, method: str, endpoint: str, data: dict | None = None
+    ) -> Any:
+        """Make a request using the full access token."""
+        if not self.full_access_token:
+            raise ValueError(
+                "Full access token not configured. Set AMAZING_MARVIN_FULL_ACCESS_TOKEN."
+            )
+        url = f"{self.base_url}{endpoint}"
+        logger.debug("Making full-access %s request to %s", method, url)
+
+        try:
+            if method.lower() == "get":
+                response = requests.get(url, headers=self.full_access_headers)
+            elif method.lower() == "post":
+                response = requests.post(
+                    url, headers=self.full_access_headers, json=data
+                )
+            else:
+                raise ValueError(f"Unsupported HTTP method: {method}")
+
+            response.raise_for_status()
+
+            no_content_status = 204
+            if response.status_code == no_content_status or not response.content:
+                return {}
+
+            return response.json()
+        except requests.exceptions.HTTPError:
+            logger.exception("HTTP error (full access)")
+            raise
+        except requests.exceptions.RequestException:
+            logger.exception("Request error (full access)")
+            raise
+
     def get_tasks(self, date: str | None = None) -> list[dict]:
         """Get all tasks and projects (use /todayItems or /dueItems for scheduled/due, or /children for subtasks)"""
         # The Marvin API does not provide a /tasks endpoint. Use /todayItems for scheduled items, /dueItems for due, or /children for subtasks.
@@ -70,12 +179,9 @@ class MarvinAPIClient:
             endpoint += f"?date={date}"
         return self._make_request("get", endpoint)
 
-    def get_task(self, task_id: str) -> dict:
-        """Get a specific task or project by ID (requires full access token, not supported by default API token)"""
-        # The Marvin API does not provide a direct /tasks/{id} endpoint. Use /api/doc?id=... with full access token for arbitrary docs.
-        raise NotImplementedError(
-            "Direct task lookup by ID is not supported with the standard API token. Use /api/doc?id=... with full access token."
-        )
+    def read_doc(self, item_id: str) -> dict:
+        """Read any document by ID using the full access token."""
+        return self._make_full_access_request("get", f"/doc?id={item_id}")
 
     def get_projects(self) -> list[dict]:
         """
@@ -221,14 +327,18 @@ class MarvinAPIClient:
         """Create a new project (experimental endpoint)"""
         return self._make_request("post", "/addProject", data=project_data)
 
-    def update_task(self, task_id: str, task_data: dict) -> dict:
-        """Update a task (requires full access token and /api/doc/update)"""
-        raise NotImplementedError(
-            "Task update is not supported with the standard API token. Use /api/doc/update with full access token."
+    def create_doc(self, doc_data: dict) -> dict:
+        """Create any document using the full access token."""
+        return self._make_full_access_request("post", "/doc/create", data=doc_data)
+
+    def update_doc(self, item_id: str, setters: list[dict]) -> dict:
+        """Update any document by ID using the full access token."""
+        return self._make_full_access_request(
+            "post", "/doc/update", data={"itemId": item_id, "setters": setters}
         )
 
-    def delete_task(self, task_id: str) -> dict:
-        """Delete a task (requires full access token and /api/doc/delete)"""
-        raise NotImplementedError(
-            "Task deletion is not supported with the standard API token. Use /api/doc/delete with full access token."
+    def delete_doc(self, item_id: str) -> dict:
+        """Delete any document by ID using the full access token."""
+        return self._make_full_access_request(
+            "post", "/doc/delete", data={"itemId": item_id}
         )

@@ -76,6 +76,14 @@ def batch_create_tasks(
                 task_data["categoryId"] = category_id
 
             created_task = api_client.create_task(task_data)
+
+            # /addTask doesn't reliably set parentId, so fix it via update_doc
+            parent_id = project_id or category_id
+            task_id = created_task.get("_id")
+            if parent_id and task_id and created_task.get("parentId") != parent_id:
+                api_client.update_doc(task_id, [{"key": "parentId", "val": parent_id}])
+                created_task["parentId"] = parent_id
+
             created_tasks.append(created_task)
         except Exception as e:
             failed_tasks.append({"task": task_info, "error": str(e)})
