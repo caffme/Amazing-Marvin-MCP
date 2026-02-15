@@ -143,14 +143,15 @@ def get_completed_tasks(api_client: MarvinAPIClient) -> dict[str, Any]:
         yesterday = DateUtils.get_yesterday()
 
         # Use efficient date-filtered API calls
-        today_completed = api_client.get_done_items()  # Defaults to today
+        today = DateUtils.get_today()
+        today_completed = api_client.get_done_items(date=today)
         yesterday_completed = api_client.get_done_items(date=yesterday)
 
         # For older items, we could either:
         # 1. Make additional API calls for specific dates
         # 2. Get all items and filter (less efficient but comprehensive)
         # For now, let's be comprehensive but note the efficiency trade-off
-        all_done_items = api_client.get_done_items()
+        all_done_items = api_client.get_done_items(date=today)
 
         # Calculate older items by exclusion
         today_ids = {item.get("_id") for item in today_completed}
@@ -261,9 +262,11 @@ def get_daily_productivity_overview(api_client: MarvinAPIClient) -> dict[str, An
     today = DateUtils.get_today()
 
     # Make efficient API calls (5 total instead of 11)
-    today_items = api_client.get_tasks()  # Today's scheduled items
+    # Pass explicit local date so the Marvin API (which defaults to UTC)
+    # returns items for the correct calendar day.
+    today_items = api_client.get_tasks(date=today)  # Today's scheduled items
     due_items = api_client.get_due_items()  # Overdue/due items
-    today_completed = api_client.get_done_items()  # Today's completed items
+    today_completed = api_client.get_done_items(date=today)  # Today's completed items
     projects = api_client.get_projects()  # For project context
     goals = api_client.get_goals()  # For goal progress
 

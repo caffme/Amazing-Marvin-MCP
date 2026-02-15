@@ -2,22 +2,22 @@
 
 import itertools
 import logging
-from datetime import datetime
 from typing import Any
 
 from .api import MarvinAPIClient
+from .date_utils import DateUtils
 
 logger = logging.getLogger(__name__)
 
 
 def get_daily_focus(api_client: MarvinAPIClient) -> dict[str, Any]:
     """Get today's focus items - due items, scheduled tasks, and completed tasks."""
-    # Get today's items and due items
-    today_items = api_client.get_tasks()  # This gets todayItems
+    today = DateUtils.get_today()
+    # Pass explicit local date so the Marvin API (which defaults to UTC)
+    # returns items for the correct calendar day.
+    today_items = api_client.get_tasks(date=today)
     due_items = api_client.get_due_items()
-
-    # Get today's completed tasks (API defaults to today if no date provided)
-    today_completed = api_client.get_done_items()
+    today_completed = api_client.get_done_items(date=today)
 
     # Combine scheduled/due items (these are pending by nature from todayItems)
     all_pending_items = []
@@ -99,8 +99,10 @@ def batch_create_tasks(
 
 def quick_daily_planning(api_client: MarvinAPIClient) -> dict[str, Any]:
     """Get a quick daily planning overview with actionable insights."""
-    # Get today's focus items
-    today_items = api_client.get_tasks()
+    today = DateUtils.get_today()
+    # Pass explicit local date so the Marvin API (which defaults to UTC)
+    # returns items for the correct calendar day.
+    today_items = api_client.get_tasks(date=today)
     due_items = api_client.get_due_items()
 
     # Get projects for context
@@ -109,8 +111,6 @@ def quick_daily_planning(api_client: MarvinAPIClient) -> dict[str, Any]:
     # Analyze workload
     total_due = len(due_items)
     total_scheduled = len(today_items)
-
-    today = datetime.now().strftime("%Y-%m-%d")
 
     # Simple prioritization suggestions
     heavy_day_threshold = 5
@@ -222,7 +222,8 @@ def get_all_tasks_impl(
     """Get all tasks and projects with optional label filtering, using recursive traversal."""
     try:
         # Get all top-level items
-        today_items = api_client.get_tasks()
+        today = DateUtils.get_today()
+        today_items = api_client.get_tasks(date=today)
         due_items = api_client.get_due_items()
         projects = api_client.get_projects()
         categories = api_client.get_categories()

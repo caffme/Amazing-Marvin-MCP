@@ -17,6 +17,7 @@ from .analytics import (
     get_productivity_summary_for_time_range as get_productivity_summary_for_time_range_impl,
 )
 from .api import create_api_client
+from .date_utils import DateUtils
 from .projects import (
     create_project_with_tasks as create_project_impl,
 )
@@ -55,7 +56,8 @@ async def get_tasks(debug: bool = False) -> StandardResponse:
     start_time = time.time()
     try:
         api_client = create_api_client()
-        raw_tasks = api_client.get_tasks()
+        today = DateUtils.get_today()
+        raw_tasks = api_client.get_tasks(date=today)
 
         return create_task_response(
             api_client=api_client,
